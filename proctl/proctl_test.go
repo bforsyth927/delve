@@ -3,6 +3,7 @@ package proctl
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -219,15 +220,47 @@ func TestClearBreakPoint(t *testing.T) {
 	})
 }
 
-func TestNext(t *testing.T) {
-	var (
-		err            error
-		executablePath = "../_fixtures/testnextprog"
-	)
+type nextTest struct {
+	begin, end int
+}
 
-	testcases := []struct {
-		begin, end int
-	}{
+func testnext(testcases []nextTest, initialLocation string, t *testing.T) {
+	var executablePath = "../_fixtures/testnextprog"
+	withTestProcess(executablePath, t, func(p *DebuggedProcess) {
+		bp, err := p.BreakByLocation(initialLocation)
+		assertNoError(err, t, "Break()")
+		assertNoError(p.Continue(), t, "Continue()")
+		p.Clear(bp.Addr)
+
+		f, ln := currentLineNumber(p, t)
+		for _, tc := range testcases {
+			fmt.Printf("begin: %d end: %d\n", tc.begin, tc.end)
+			if ln != tc.begin {
+				t.Fatalf("Program not stopped at correct spot expected %d was %s:%d", tc.begin, filepath.Base(f), ln)
+			}
+
+			assertNoError(p.Next(), t, "Next() returned an error")
+
+			f, ln = currentLineNumber(p, t)
+			if ln != tc.end {
+				t.Fatalf("Program did not continue to correct next location expected %d was %s:%d", tc.end, filepath.Base(f), ln)
+			}
+		}
+
+		if len(p.BreakPoints) != 0 {
+			t.Fatal("Not all breakpoints were cleaned up", len(p.HWBreakPoints))
+		}
+		for _, bp := range p.HWBreakPoints {
+			if bp != nil {
+				t.Fatal("Not all breakpoints were cleaned up", bp.Addr)
+			}
+		}
+	})
+}
+
+func TestNextGeneral(t *testing.T) {
+	testcases := []nextTest{
+		{17, 19},
 		{19, 20},
 		{20, 23},
 		{23, 24},
@@ -242,47 +275,25 @@ func TestNext(t *testing.T) {
 		{24, 26},
 		{26, 27},
 		{27, 34},
-		{34, 41},
-		{41, 40},
-		{40, 41},
 	}
+	testnext(testcases, "main.testnext", t)
+}
 
-	fp, err := filepath.Abs("../_fixtures/testnextprog.go")
-	if err != nil {
-		t.Fatal(err)
+func TestNextGoroutine(t *testing.T) {
+	testcases := []nextTest{
+		{46, 47},
+		{47, 48},
+		{48, 42},
 	}
+	testnext(testcases, "main.testgoroutine", t)
+}
 
-	withTestProcess(executablePath, t, func(p *DebuggedProcess) {
-		pc, _, _ := p.goSymTable.LineToPC(fp, testcases[0].begin)
-		_, err := p.Break(pc)
-		assertNoError(err, t, "Break()")
-		assertNoError(p.Continue(), t, "Continue()")
-		p.Clear(pc)
-
-		f, ln := currentLineNumber(p, t)
-		for _, tc := range testcases {
-			if ln != tc.begin {
-				t.Fatalf("Program not stopped at correct spot expected %d was %s:%d", tc.begin, filepath.Base(f), ln)
-			}
-
-			assertNoError(p.Next(), t, "Next() returned an error")
-
-			f, ln = currentLineNumber(p, t)
-			if ln != tc.end {
-				t.Fatalf("Program did not continue to correct next location expected %d was %s:%d", tc.end, filepath.Base(f), ln)
-			}
-		}
-
-		p.Clear(pc)
-		if len(p.BreakPoints) != 0 {
-			t.Fatal("Not all breakpoints were cleaned up", len(p.HWBreakPoints))
-		}
-		for _, bp := range p.HWBreakPoints {
-			if bp != nil {
-				t.Fatal("Not all breakpoints were cleaned up", bp.Addr)
-			}
-		}
-	})
+func TestNextFunctionReturn(t *testing.T) {
+	testcases := []nextTest{
+		{13, 14},
+		{14, 35},
+	}
+	testnext(testcases, "main.helloworld", t)
 }
 
 func TestFindReturnAddress(t *testing.T) {
@@ -331,10 +342,9 @@ func TestFindReturnAddress(t *testing.T) {
 		readMemory(p.CurrentThread, uintptr(addr), data)
 		addr = binary.LittleEndian.Uint64(data)
 
-		linuxExpected := uint64(0x400fbc)
-		darwinExpected := uint64(0x23bc)
-		if addr != linuxExpected && addr != darwinExpected {
-			t.Fatalf("return address not found correctly, expected (linux) %#v or (darwin) %#v got %#v", linuxExpected, darwinExpected, addr)
+		_, l, _ := p.goSymTable.PCToLine(addr)
+		if l != 40 {
+			t.Fatalf("return address not found correctly, expected line 40")
 		}
 	})
 }
@@ -409,7 +419,8 @@ func TestFunctionCall(t *testing.T) {
 		if fn.Name != "main.main" {
 			t.Fatal("Program stopped at incorrect place")
 		}
-		if err = p.CallFn("runtime.getg", func(th *ThreadContext) error {
+		if err = p.CallFn("runtime.getg", func() error {
+			th := p.CurrentThread
 			pc, err := th.CurrentPC()
 			if err != nil {
 				t.Fatal(err)

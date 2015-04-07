@@ -1,9 +1,10 @@
 package proctl
 
 import (
-	"encoding/binary"
 	"fmt"
+	"path/filepath"
 
+	"github.com/derekparker/delve/dwarf/frame"
 	sys "golang.org/x/sys/unix"
 )
 
@@ -16,6 +17,7 @@ type ThreadContext struct {
 	Id      int
 	Process *DebuggedProcess
 	Status  *sys.WaitStatus
+	running bool
 	os      *OSSpecificDetails
 }
 
@@ -65,7 +67,6 @@ func (thread *ThreadContext) Continue() error {
 			return fmt.Errorf("could not step %s", err)
 		}
 	}
-
 	return thread.resume()
 }
 
@@ -108,14 +109,14 @@ func (thread *ThreadContext) Step() (err error) {
 }
 
 // Call a function named `name`. This is currently _NOT_ safe.
-func (thread *ThreadContext) CallFn(name string, fn func(*ThreadContext) error) error {
+func (thread *ThreadContext) CallFn(name string, fn func() error) error {
 	f := thread.Process.goSymTable.LookupFunc(name)
 	if f == nil {
 		return fmt.Errorf("could not find function %s", name)
 	}
 
 	// Set breakpoint at the end of the function (before it returns).
-	bp, err := thread.Process.Break(f.End - 2)
+	bp, err := thread.Break(f.End - 2)
 	if err != nil {
 		return err
 	}
@@ -134,7 +135,17 @@ func (thread *ThreadContext) CallFn(name string, fn func(*ThreadContext) error) 
 	if _, err = trapWait(thread.Process, -1); err != nil {
 		return err
 	}
-	return fn(thread)
+	return fn()
+}
+
+// Set breakpoint using this thread.
+func (thread *ThreadContext) Break(addr uint64) (*BreakPoint, error) {
+	return thread.Process.setBreakpoint(thread.Id, addr, false)
+}
+
+// Clear breakpoint using this thread.
+func (thread *ThreadContext) Clear(addr uint64) (*BreakPoint, error) {
+	return thread.Process.clearBreakpoint(thread.Id, addr)
 }
 
 // Step to next source line.
@@ -166,34 +177,95 @@ func (thread *ThreadContext) Next() (err error) {
 
 	// Get current file/line.
 	f, l, _ := thread.Process.goSymTable.PCToLine(curpc)
+	if filepath.Ext(f) == ".go" {
+		if err = thread.next(curpc, fde, f, l); err != nil {
+			return err
+		}
+	} else {
+		if err = thread.cnext(curpc, fde, f, l); err != nil {
+			return err
+		}
+	}
+	return thread.Continue()
+}
 
+// Go routine is exiting.
+type GoroutineExitingError struct {
+	goid int
+}
+
+func (ge GoroutineExitingError) Error() string {
+	return fmt.Sprintf("goroutine %d is exiting", ge.goid)
+}
+
+func (thread *ThreadContext) next(curpc uint64, fde *frame.FrameDescriptionEntry, file string, line int) error {
+	f, l, _ := thread.Process.goSymTable.PCToLine(curpc)
+	fmt.Printf("current location %s:%d %#v\n", f, l, curpc)
 	// Find any line we could potentially get to.
-	lines, err := thread.Process.ast.NextLines(f, l)
+	lines, err := thread.Process.ast.NextLines(file, line)
 	if err != nil {
 		return err
 	}
 
-	// Set a breakpoint at every line reachable from our location.
+	ret, err := thread.ReturnAddress()
+	if err != nil {
+		return err
+	}
+
+	pcs := make([]uint64, 0, len(lines))
 	for _, l := range lines {
-		pcs := thread.Process.lineInfo.AllPCsForFileLine(f, l)
-		for _, pc := range pcs {
-			if pc == curpc {
-				continue
-			}
-			if !fde.Cover(pc) {
-				pc = thread.ReturnAddressFromOffset(fde.ReturnAddressOffset(curpc))
-			}
-			bp, err := thread.Process.Break(pc)
-			if err != nil {
-				if err, ok := err.(BreakPointExistsError); !ok {
-					return err
-				}
-				continue
-			}
-			bp.Temp = true
+		pcs = append(pcs, thread.Process.lineInfo.AllPCsForFileLine(file, l)...)
+	}
+
+	var covered bool
+	for _, pc := range pcs {
+		if fde.Cover(pc) {
+			covered = true
 		}
 	}
-	return thread.Continue()
+
+	if !covered {
+		fn := thread.Process.goSymTable.PCToFunc(ret)
+		if fn != nil && fn.Name == "runtime.goexit" {
+			g, err := thread.curG()
+			if err != nil {
+				return err
+			}
+			return GoroutineExitingError{goid: g.Id}
+		}
+		pcs = append(pcs, ret)
+	}
+	fmt.Println(thread.Id, lines)
+	fmt.Printf("pcs %#v\n", pcs)
+
+	// Set a breakpoint at every line reachable from our location.
+	for _, pc := range pcs {
+		// Do not set breakpoint at our current location.
+		if pc == curpc {
+			continue
+		}
+		// If the PC is not covered by our frame, set breakpoint at return address.
+		if !fde.Cover(pc) {
+			pc = ret
+		}
+		if _, err := thread.Process.TempBreak(pc); err != nil {
+			if err, ok := err.(BreakPointExistsError); !ok {
+				return err
+			}
+			continue
+		}
+	}
+	return nil
+}
+
+func (thread *ThreadContext) cnext(curpc uint64, fde *frame.FrameDescriptionEntry, file string, line int) error {
+	fmt.Println("CNEXT", thread.Id)
+	// We are in c land, we cannot rely on the Go AST.
+	// Ideas:
+	// * Use DWARF line info to figure out next line
+	// * Assume we're not supposed to be here and continue out of function (will not work long term)
+	// * Fall back to single step implementation (not acceptable for parallelism)
+	return nil
 }
 
 func (thread *ThreadContext) SetPC(pc uint64) error {
@@ -204,47 +276,32 @@ func (thread *ThreadContext) SetPC(pc uint64) error {
 	return regs.SetPC(thread, pc)
 }
 
-// Takes an offset from RSP and returns the address of the
-// instruction the currect function is going to return to.
-func (thread *ThreadContext) ReturnAddressFromOffset(offset int64) uint64 {
-	regs, err := thread.Registers()
-	if err != nil {
-		panic("Could not obtain register values")
-	}
-
-	retaddr := int64(regs.SP()) + offset
-	data := make([]byte, 8)
-	readMemory(thread, uintptr(retaddr), data)
-	return binary.LittleEndian.Uint64(data)
-}
-
 func (thread *ThreadContext) clearTempBreakpoint(pc uint64) error {
-	clearbp := func(bp *BreakPoint) error {
-		if _, err := thread.Process.Clear(bp.Addr); err != nil {
-			return err
-		}
-		return thread.SetPC(bp.Addr)
-	}
 	for _, bp := range thread.Process.HWBreakPoints {
 		if bp != nil && bp.Temp && bp.Addr == pc {
-			return clearbp(bp)
+			_, err := bp.Clear(thread)
+			return err
 		}
 	}
 	if bp, ok := thread.Process.BreakPoints[pc]; ok && bp.Temp {
-		return clearbp(bp)
+		_, err := bp.Clear(thread)
+		if err != nil {
+			return err
+		}
+		return thread.SetPC(bp.Addr)
 	}
 	return nil
 }
 
 func (thread *ThreadContext) curG() (*G, error) {
 	var g *G
-	err := thread.CallFn("runtime.getg", func(t *ThreadContext) error {
-		regs, err := t.Registers()
+	err := thread.CallFn("runtime.getg", func() error {
+		regs, err := thread.Registers()
 		if err != nil {
 			return err
 		}
-		reader := t.Process.dwarf.Reader()
-		g, err = parseG(t.Process, regs.SP()+uint64(ptrsize), reader)
+		reader := thread.Process.dwarf.Reader()
+		g, err = parseG(thread, regs.SP()+uint64(ptrsize), reader)
 		return err
 	})
 	return g, err
