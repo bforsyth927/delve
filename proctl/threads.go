@@ -215,7 +215,9 @@ func (thread *ThreadContext) next(curpc uint64, fde *frame.FrameDescriptionEntry
 	pcs := make([]uint64, 0, len(lines))
 	for _, l := range lines {
 		pcs = append(pcs, thread.Process.lineInfo.AllPCsForFileLine(file, l)...)
+		fmt.Printf("line %d %#v\n", l, pcs)
 	}
+	fmt.Println(thread.Id, lines)
 
 	var covered bool
 	for _, pc := range pcs {
@@ -235,8 +237,6 @@ func (thread *ThreadContext) next(curpc uint64, fde *frame.FrameDescriptionEntry
 		}
 		pcs = append(pcs, ret)
 	}
-	fmt.Println(thread.Id, lines)
-	fmt.Printf("pcs %#v\n", pcs)
 
 	// Set a breakpoint at every line reachable from our location.
 	for _, pc := range pcs {
@@ -252,14 +252,12 @@ func (thread *ThreadContext) next(curpc uint64, fde *frame.FrameDescriptionEntry
 			if err, ok := err.(BreakPointExistsError); !ok {
 				return err
 			}
-			continue
 		}
 	}
 	return nil
 }
 
 func (thread *ThreadContext) cnext(curpc uint64, fde *frame.FrameDescriptionEntry, file string, line int) error {
-	fmt.Println("CNEXT", thread.Id)
 	// We are in c land, we cannot rely on the Go AST.
 	// Ideas:
 	// * Use DWARF line info to figure out next line
@@ -274,23 +272,6 @@ func (thread *ThreadContext) SetPC(pc uint64) error {
 		return err
 	}
 	return regs.SetPC(thread, pc)
-}
-
-func (thread *ThreadContext) clearTempBreakpoint(pc uint64) error {
-	for _, bp := range thread.Process.HWBreakPoints {
-		if bp != nil && bp.Temp && bp.Addr == pc {
-			_, err := bp.Clear(thread)
-			return err
-		}
-	}
-	if bp, ok := thread.Process.BreakPoints[pc]; ok && bp.Temp {
-		_, err := bp.Clear(thread)
-		if err != nil {
-			return err
-		}
-		return thread.SetPC(bp.Addr)
-	}
-	return nil
 }
 
 func (thread *ThreadContext) curG() (*G, error) {

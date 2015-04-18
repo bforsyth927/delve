@@ -298,18 +298,22 @@ func (dbp *DebuggedProcess) next() error {
 	}
 
 	for {
-		fmt.Println("BEGIN NEXT WAIT")
 		thread, err := trapWait(dbp, -1)
 		if err != nil {
 			return err
 		}
-		fmt.Println("FIN NEXT WAIT")
 		if goroutineExiting {
 			break
 		}
 		if dbp.CurrentBreakpoint != nil {
-			if _, err := dbp.CurrentBreakpoint.Clear(thread); err != nil {
+			bp, err := dbp.Clear(dbp.CurrentBreakpoint.Addr)
+			if err != nil {
 				return err
+			}
+			if !bp.hardware {
+				if err = thread.SetPC(bp.Addr); err != nil {
+					return err
+				}
 			}
 		}
 		// Grab the current goroutine for this thread.

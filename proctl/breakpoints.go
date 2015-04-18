@@ -132,19 +132,27 @@ func (dbp *DebuggedProcess) setBreakpoint(tid int, addr uint64, temp bool) (*Bre
 
 func (dbp *DebuggedProcess) clearBreakpoint(tid int, addr uint64) (*BreakPoint, error) {
 	thread := dbp.Threads[tid]
-	// Check for software breakpoint
+	// Check for hardware breakpoint
 	for i, bp := range dbp.HWBreakPoints {
 		if bp == nil {
 			continue
 		}
 		if bp.Addr == addr {
+			_, err := bp.Clear(thread)
+			if err != nil {
+				return nil, err
+			}
 			dbp.HWBreakPoints[i] = nil
-			return bp.Clear(thread)
+			return bp, nil
 		}
 	}
+	// Check for software breakpoint
 	if bp, ok := dbp.BreakPoints[addr]; ok {
+		if _, err := bp.Clear(thread); err != nil {
+			return nil, err
+		}
 		delete(dbp.BreakPoints, addr)
-		return bp.Clear(thread)
+		return bp, nil
 	}
 	return nil, fmt.Errorf("no breakpoint at %#v", addr)
 }

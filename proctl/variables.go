@@ -44,6 +44,7 @@ type G struct {
 	Line       int
 	Func       *gosym.Func
 	WaitReason string
+	spcache    map[uint64]uint64
 }
 
 func (g *G) ChanRecvBlocked() bool {
@@ -282,6 +283,10 @@ func parseG(thread *ThreadContext, addr uint64, reader *dwarf.Reader) (*G, error
 		return nil, fmt.Errorf("error reading goroutine SP %s", err)
 	}
 	gosp := binary.LittleEndian.Uint64(spbytes)
+	if waitreason == "chan receive" {
+		goid := int(binary.LittleEndian.Uint64(goidbytes))
+		fmt.Printf("%d SCHED ADDR %#v GOSP %#v, GOSP bytes %#v\n", goid, schedaddr, gosp, spbytes)
+	}
 
 	f, l, fn := thread.Process.goSymTable.PCToLine(gopc)
 	g := &G{
@@ -293,6 +298,7 @@ func parseG(thread *ThreadContext, addr uint64, reader *dwarf.Reader) (*G, error
 		Line:       l,
 		Func:       fn,
 		WaitReason: waitreason,
+		spcache:    make(map[uint64]uint64),
 	}
 	return g, nil
 }

@@ -231,10 +231,11 @@ func testnext(testcases []nextTest, initialLocation string, t *testing.T) {
 		assertNoError(err, t, "Break()")
 		assertNoError(p.Continue(), t, "Continue()")
 		p.Clear(bp.Addr)
+		p.CurrentThread.SetPC(bp.Addr)
 
 		f, ln := currentLineNumber(p, t)
 		for _, tc := range testcases {
-			fmt.Printf("begin: %d end: %d\n", tc.begin, tc.end)
+			fmt.Println("begin: -------------------------------- ", tc.begin)
 			if ln != tc.begin {
 				t.Fatalf("Program not stopped at correct spot expected %d was %s:%d", tc.begin, filepath.Base(f), ln)
 			}
@@ -248,7 +249,7 @@ func testnext(testcases []nextTest, initialLocation string, t *testing.T) {
 		}
 
 		if len(p.BreakPoints) != 0 {
-			t.Fatal("Not all breakpoints were cleaned up", len(p.HWBreakPoints))
+			t.Fatal("Not all breakpoints were cleaned up", len(p.BreakPoints))
 		}
 		for _, bp := range p.HWBreakPoints {
 			if bp != nil {

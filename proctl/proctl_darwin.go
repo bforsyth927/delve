@@ -175,9 +175,7 @@ func (dbp *DebuggedProcess) findExecutable() (*macho.File, error) {
 }
 
 func trapWait(dbp *DebuggedProcess, pid int) (*ThreadContext, error) {
-	fmt.Println("begin mach wait")
 	port := C.mach_port_wait(dbp.os.portSet)
-	fmt.Println("fin mach wait")
 
 	switch port {
 	case dbp.os.notificationPort:
